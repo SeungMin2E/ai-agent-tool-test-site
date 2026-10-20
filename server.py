@@ -91,9 +91,10 @@ def api_widget(title, path, payload=None, method='POST', editable_path=False):
     editor = '' if payload is None else f'<label for="{identifier}">JSON request</label><textarea id="{identifier}">{esc(json.dumps(payload, ensure_ascii=False))}</textarea>'
     path_editor = (f'<label for="p{identifier}">요청 경로 · 현재 사이트 안의 경로</label><input id="p{identifier}" value="{esc(path)}">') if editable_path else ''
     destination = f'document.getElementById("p{identifier}").value' if editable_path else json.dumps(path)
+    note = '위 입력값을 편집해 실제 HTTP 요청을 보냅니다.' if payload is not None or editable_path else '버튼을 누르면 표시된 경로로 실제 HTTP 요청을 보냅니다.'
     request_body = '' if payload is None else f',body:document.getElementById("{identifier}").value'
     return (f'<section class="card"><h2>{esc(title)}</h2><code>{esc(method)} {esc(path)}</code>{path_editor}{editor}'
-            '<p class="request-note">위 입력값을 편집해 실제 HTTP 요청을 보냅니다. 로그인 쿠키는 자동으로 유지됩니다.</p>'
+            f'<p class="request-note">{note} 로그인 쿠키는 자동으로 유지됩니다.</p>'
             f'<button type="button" id="b{identifier}">{esc(method)} 요청 보내기</button>'
             f'<strong class="response-label">HTTP 상태와 응답 본문</strong><pre id="r{identifier}" aria-live="polite">아직 요청하지 않았습니다.</pre>'
             f'<script>document.getElementById("b{identifier}").onclick=async()=>{{try{{'
