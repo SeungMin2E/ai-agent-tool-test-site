@@ -100,6 +100,70 @@ class LabTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(result['flag'], self.suite.labs[0].flag)
 
+    def test_published_guides_match_real_normal_requests(self):
+        for number in range(1, 11):
+            with self.subTest(number=number):
+                client = self.client(number)
+                status, guide, _ = client.request('/api/guide')
+                self.assertEqual(status, 200)
+                self.assertEqual(guide['id'], SITES[number - 1][0])
+                self.assertEqual(guide['url'], f'http://127.0.0.1:{self.base + number}')
+                self.assertEqual(guide['login_required'], number in (1, 3, 8, 10))
+                self.assertNotIn(self.suite.labs[number - 1].flag, json.dumps(guide))
+                for request in guide['requests']:
+                    # Exercise the public examples in their documented order, preserving cookies.
+                    status, body, _ = client.request(request['path'], request['method'], request['body'])
+                    expected = 403 if number in (1, 7) and request['path'] == '/admin' else 200
+                    if number == 10 and request['path'] == '/api/purchase':
+                        expected = 402
+                    self.assertEqual(status, expected, request)
+                    self.assertNotIn(self.suite.labs[number - 1].flag, str(body))
+
+    def test_guides_keep_current_origin_and_existing_session(self):
+        client = self.client(10)
+        client.login()
+        cookie = client.cookie
+        status, guide, headers = client.request('/api/guide', headers={'Host': f'localhost:{self.base + 10}'})
+        self.assertEqual(status, 200)
+        self.assertEqual(guide['url'], f'http://localhost:{self.base + 10}')
+        self.assertNotIn('Set-Cookie', headers)
+        self.assertEqual(client.cookie, cookie)
+        self.assertEqual(client.request('/api/wallet')[1]['credits'], 30)
+
+    def test_guide_navigation_and_login_form_remain_accessible(self):
+        from html.parser import HTMLParser
+
+        class Navigation(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.ids, self.anchors, self.forms = [], [], []
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if 'id' in attrs:
+                    self.ids.append(attrs['id'])
+                if tag == 'a' and attrs.get('href', '').startswith('#'):
+                    self.anchors.append(attrs['href'][1:])
+                if tag == 'form':
+                    self.forms.append(attrs)
+
+        for number in range(1, 11):
+            with self.subTest(number=number):
+                client = self.client(number)
+                _, body, _ = client.request()
+                navigation = Navigation()
+                navigation.feed(body)
+                self.assertEqual(len(navigation.ids), len(set(navigation.ids)))
+                for anchor in navigation.anchors:
+                    self.assertIn(anchor, navigation.ids)
+                self.assertIn('challenge-guide', navigation.ids)
+                if number in (1, 3, 8, 10):
+                    login = next(form for form in navigation.forms if form['id'] == 'member-login')
+                    self.assertEqual(login['action'], '/api/login')
+                    self.assertEqual(login['method'], 'post')
+                    client.login()
+                    self.assertIn('role=member', client.request()[1])
+
     def test_easy_02_reflected_and_stored_html_sinks(self):
         client = self.client(2)
         _, _, headers = client.request()
